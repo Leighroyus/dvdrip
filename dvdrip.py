@@ -653,7 +653,11 @@ def PerformTasks(dvd, tasks, title_count, filenames,
                     % (task.title.number, title_count, task.chapter,
                         num_chapters, filename))
         print('-' * 78)
-        dvd.RipTitle(task, filename, dry_run, verbose, no_subtitles)
+        try:
+            dvd.RipTitle(task, filename, dry_run, verbose, no_subtitles)
+        except subprocess.CalledProcessError as exc:
+            warn("Failed to encode title %d (exit status %d), skipping."
+                 % (task.title.number, exc.returncode))
 
 Size = namedtuple('Size',
         ['width', 'height', 'pix_aspect_width', 'pix_aspect_height', 'fps'])
