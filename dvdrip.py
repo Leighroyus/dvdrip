@@ -430,7 +430,14 @@ class DVD:
             pprint(task.title.info)
             print('-' * 78)
 
-        audio_tracks = list(task.title.info['audio tracks'].keys())
+        all_audio_tracks = list(ParseAudioTracks(task.title.info['audio tracks']))
+        eng_tracks = [at for at in all_audio_tracks if at.iso639_2.strip() == 'eng']
+        if eng_tracks:
+            selected_audio = eng_tracks
+        else:
+            warn('No English audio tracks found; including all %d track(s)' % len(all_audio_tracks))
+            selected_audio = all_audio_tracks
+
         subtitles = list(task.title.info['subtitle tracks'].keys())
 
         args = [
@@ -452,6 +459,9 @@ class DVD:
             '--deinterlace',
             '--nlmeans=light',  # CRITICAL: Must use = not space for correct quality!
         ]
+
+        if selected_audio:
+            args += ['--audio', ','.join(str(at.number) for at in selected_audio)]
 
         if task.chapter is not None:
             args += ['--chapters', str(task.chapter)]
