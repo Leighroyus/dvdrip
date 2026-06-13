@@ -11,6 +11,7 @@ Rip DVDs quickly and easily from the command line.
 - **Join multiple titles** into a single file (great for special features discs)
 - **Subtitle control** - include all, or exclude with `--no-subtitles`
 - **Scan mode** to preview disc contents before ripping
+- **Optional MakeMKV fallback** for discs HandBrake cannot decrypt directly
 
 ## Dependencies
 
@@ -18,6 +19,7 @@ Rip DVDs quickly and easily from the command line.
 - [HandBrakeCLI](https://handbrake.fr/)
 - [FFmpeg](https://ffmpeg.org/) (required for `--join` feature)
 - [tmdbsimple](https://github.com/celiao/tmdbsimple) (optional, for metadata lookup)
+- [MakeMKV](https://www.makemkv.com/) (optional, for `--use-makemkv-fallback`)
 
 ### Installation
 
@@ -28,6 +30,8 @@ sudo apt install handbrake-cli ffmpeg
 # Install optional TMDb support
 pip install tmdbsimple
 ```
+
+For encrypted/problem discs, install MakeMKV separately so `makemkvcon` is available on `PATH`.
 
 ## Quick Start
 
@@ -54,6 +58,9 @@ python3 dvdrip.py -t 1,2,3 -o MovieName
 
 # Rip main feature only
 python3 dvdrip.py --main-feature -o MovieName
+
+# Smaller output files
+python3 dvdrip.py --quality 20 -o MovieName
 ```
 
 ## Common Use Cases
@@ -113,6 +120,21 @@ echo "your_api_key_here" > ~/.tmdb_api_key
 python3 dvdrip.py --no-subtitles -o MovieName
 ```
 
+### Using MakeMKV as a Fallback
+
+```bash
+# If HandBrake cannot scan the disc, extract titles with MakeMKV and encode them automatically
+python3 dvdrip.py --use-makemkv-fallback -o MovieName
+
+# Override the MakeMKV source on a multi-drive system if needed
+python3 dvdrip.py --use-makemkv-fallback --makemkv-source disc:1 -o MovieName
+
+# Smaller output from the MakeMKV fallback path
+python3 dvdrip.py --use-makemkv-fallback --quality 20 -o MovieName
+```
+
+The MakeMKV fallback extracts MKV title files with `makemkvcon` and then encodes them to MP4 with x265. It does not preserve the original DVD title/chapter scan path once fallback is used.
+
 ## Command Reference
 
 | Option | Description |
@@ -120,6 +142,7 @@ python3 dvdrip.py --no-subtitles -o MovieName
 | `-i, --input` | Input device/path (auto-detected if omitted) |
 | `-o, --output` | Output filename/directory (required for ripping) |
 | `--scan` | Scan disc and display contents without ripping |
+| `--quality` | Video quality for x265 encoding; higher values produce smaller files |
 | `-t, --titles` | Comma-separated title numbers or ranges (e.g., `1,2,3` or `1-5`) |
 | `-c, --chapter_split` | Split each chapter into a separate file |
 | `--main-feature` | Rip only the longest title (main feature) |
@@ -127,6 +150,8 @@ python3 dvdrip.py --no-subtitles -o MovieName
 | `--join-titles` | Join specific titles (e.g., `1,2,3`) |
 | `--keep-files` | Keep individual files after joining |
 | `--no-subtitles` | Exclude all subtitle tracks |
+| `--use-makemkv-fallback` | If HandBrake cannot scan titles, decrypt with MakeMKV and retry |
+| `--makemkv-source` | Override the MakeMKV source specifier (for example, `disc:0`) |
 | `--title-search` | Search TMDb for metadata |
 | `--year` | Release year (helps narrow TMDb search) |
 | `--tv` | Search for TV show instead of movie |
@@ -144,9 +169,11 @@ python3 dvdrip.py --no-subtitles -o MovieName
 
 ## Encoding Settings
 
-- **Video**: x265 (HEVC) at CRF 16 with detelecine, deinterlace, and light denoise
+- **Video**: x265 (HEVC) at CRF/quality 16 by default with detelecine, deinterlace, and light denoise
 - **Audio**: Copied from source (preserves all audio tracks)
 - **Container**: MP4 with optimization for streaming
+
+Higher `--quality` values reduce file size. A value around `20` to `22` is a reasonable starting point when you want smaller files than the default.
 
 ## Troubleshooting
 

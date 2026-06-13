@@ -131,6 +131,7 @@ import os
 import re
 import subprocess
 import tempfile
+import shutil
 
 try:
     import tmdbsimple as tmdb
@@ -285,6 +286,14 @@ def find_optical_drive_device(prefer_with_media: bool = True) -> str:
     scored.sort(reverse=True)
     return scored[0][1]
 
+def optical_drive_devices() -> list[str]:
+    devices = []
+    for dev in sorted(glob.glob("/dev/sr*")):
+        props = _udev_props(dev)
+        if props.get("ID_CDROM") == "1":
+            devices.append(dev)
+    return devices
+
 def check_err(*popenargs, **kwargs):
     process = subprocess.Popen(stderr=subprocess.PIPE, *popenargs, **kwargs)
     _, stderr = process.communicate()
@@ -299,6 +308,246 @@ def check_err(*popenargs, **kwargs):
 def check_output(*args, **kwargs):
     s = subprocess.check_output(*args, **kwargs).decode(CHAR_ENCODING)
     return s.replace(os.linesep, '\n')
+
+def decode_process_output(output):
+    if output is None:
+        return ''
+    if isinstance(output, bytes):
+        return output.decode(CHAR_ENCODING, 'replace')
+    return str(output)
+
+def format_process_error(exc):
+    detail = decode_process_output(exc.output).strip()
+    if not detail:
+        return 'HandBrakeCLI did not provide any error details.'
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    if not lines:
+        return 'HandBrakeCLI did not provide any error details.'
+    return ' '.join(lines[-3:])
+
+def describe_disc_layout(path):
+    if not path or not os.path.isdir(path):
+        return None
+
+    try:
+        entries = {name.upper() for name in os.listdir(path)}
+    except OSError:
+        return None
+
+    if 'VIDEO_TS' in entries:
+        return ('DVD-Video layout detected at %r.' % path,
+                'This disc should expose DVD titles; if HandBrake still finds none, '
+                'the most likely causes are CSS or newer copy protection that '
+                'HandBrake cannot decrypt in this environment, disc damage, or '
+                'the drive misreading the disc.')
+    if 'BDMV' in entries:
+        return ('Blu-ray layout detected at %r.' % path,
+                'This script is built around DVD title scanning and HandBrake may not '
+                'treat this disc like a DVD source.')
+    if entries:
+        sample = ', '.join(sorted(entries)[:5])
+        return ('Mounted disc contents at %r do not look like DVD-Video.' % path,
+                'Top-level entries include: %s.' % sample)
+    return ('Mounted disc at %r appears empty.' % path,
+            'HandBrake cannot scan titles from an empty or unreadable volume.')
+
+def build_scan_failure_message(title_number, exc, mountpoint=None):
+    parts = [
+        "cannot scan title %d (exit status %d)." % (title_number, exc.returncode),
+        format_process_error(exc),
+    ]
+    layout = describe_disc_layout(mountpoint)
+    if layout:
+        parts.extend(layout)
+        if ('DVD-Video layout detected' in layout[0]
+                and '0 valid title(s)' in decode_process_output(exc.output)):
+            parts.append(
+                "Suggested next steps: install DVD decryption support "
+                "(for Debian/Ubuntu: `sudo apt install libdvd-pkg` then "
+                "`sudo dpkg-reconfigure libdvd-pkg`) or decrypt the disc "
+                "first with MakeMKV and run dvdrip on the decrypted files."
+            )
+    return ' '.join(parts)
+
+def summarize_scan_attempts(title_number, attempts):
+    if not attempts:
+        return None
+
+    tried = []
+    saw_no_titles = False
+    for attempt in attempts:
+        label = repr(attempt['input'])
+        if attempt['no_dvdnav']:
+            label += ' with --no-dvdnav'
+        tried.append(label)
+        if '0 valid title(s)' in attempt['detail']:
+            saw_no_titles = True
+
+    summary = "HandBrake scan for title %d failed for: %s." % (
+        title_number, ', '.join(tried))
+    if saw_no_titles:
+        summary += " HandBrake reported 0 valid titles for every attempt."
+    return summary
+
+def should_try_makemkv_fallback(exc, dvd, args):
+    if not getattr(args, 'use_makemkv_fallback', False):
+        return False
+    if not getattr(dvd, 'device', None):
+        return False
+    message = getattr(exc, 'message', str(exc))
+    return ('DVD-Video layout detected' in message and
+            '0 valid title(s)' in message)
+
+def detail_from_completed_process(result):
+    detail = decode_process_output(result.stderr).strip()
+    if not detail:
+        detail = decode_process_output(result.stdout).strip()
+    return detail or 'MakeMKV did not provide any error details.'
+
+def default_makemkv_source_for_device(devnode):
+    devices = optical_drive_devices()
+    if devnode in devices:
+        return 'disc:%d' % devices.index(devnode)
+    return 'disc:0'
+
+def makemkv_source_candidates(dvd, args):
+    if args.makemkv_source:
+        return (args.makemkv_source,)
+
+    candidates = ['disc:0']
+    if getattr(dvd, 'device', None):
+        candidates.append('dev:%s' % dvd.device)
+        candidates.append(default_makemkv_source_for_device(dvd.device))
+    candidates.extend(['disc:1', 'disc:2'])
+
+    unique = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
+
+def is_dvd_video_dir(path):
+    try:
+        entries = {name.upper() for name in os.listdir(path)}
+    except OSError:
+        return False
+    if 'VIDEO_TS' in entries:
+        return True
+    if 'VIDEO_TS.IFO' in entries:
+        return True
+    return any(name.startswith('VTS_') and name.endswith('.IFO')
+               for name in entries)
+
+def sample_tree_paths(root, max_entries=12):
+    results = []
+    try:
+        for current_root, dirs, files in os.walk(root):
+            rel_root = os.path.relpath(current_root, root)
+            if rel_root == '.':
+                rel_root = ''
+            for name in sorted(dirs):
+                entry = os.path.join(rel_root, name) if rel_root else name
+                results.append(entry + '/')
+                if len(results) >= max_entries:
+                    return results
+            for name in sorted(files):
+                entry = os.path.join(rel_root, name) if rel_root else name
+                results.append(entry)
+                if len(results) >= max_entries:
+                    return results
+    except OSError:
+        return results
+    return results
+
+def locate_makemkv_backup_source(output_dir):
+    candidates = [output_dir]
+    try:
+        for root, dirs, files in os.walk(output_dir):
+            if root != output_dir:
+                candidates.append(root)
+            # DVD backups are shallow; keep the search bounded.
+            relpath = os.path.relpath(root, output_dir)
+            depth = 0 if relpath == '.' else relpath.count(os.sep) + 1
+            if depth >= 2:
+                dirs[:] = []
+    except OSError:
+        pass
+
+    for candidate in candidates:
+        if is_dvd_video_dir(candidate):
+            return candidate
+    sample = sample_tree_paths(output_dir)
+    message = "MakeMKV backup completed, but no DVD-Video content was found in %r" % output_dir
+    if sample:
+        message += ". Sample contents: %s" % ', '.join(repr(item) for item in sample)
+    else:
+        message += ". The backup directory appears empty."
+    raise UserError(message)
+
+def locate_makemkv_mkv_output(output_dir):
+    mkv_files = []
+    try:
+        for root, dirs, files in os.walk(output_dir):
+            relpath = os.path.relpath(root, output_dir)
+            depth = 0 if relpath == '.' else relpath.count(os.sep) + 1
+            if depth >= 2:
+                dirs[:] = []
+            for name in sorted(files):
+                if name.lower().endswith('.mkv'):
+                    mkv_files.append(os.path.join(root, name))
+    except OSError:
+        pass
+    if mkv_files:
+        return tuple(mkv_files)
+
+    sample = sample_tree_paths(output_dir)
+    message = "MakeMKV extraction completed, but no MKV files were found in %r" % output_dir
+    if sample:
+        message += ". Sample contents: %s" % ', '.join(repr(item) for item in sample)
+    else:
+        message += ". The extraction directory appears empty."
+    raise UserError(message)
+
+def decrypt_with_makemkv(dvd, args):
+    makemkvcon = shutil.which('makemkvcon')
+    if not makemkvcon:
+        raise UserError(
+            "MakeMKV fallback requested, but `makemkvcon` was not found on PATH")
+
+    last_error = None
+    for source in makemkv_source_candidates(dvd, args):
+        output_dir = tempfile.mkdtemp(prefix='dvdrip_makemkv_')
+        cmd = [makemkvcon, 'mkv', '--decrypt', source, 'all', output_dir]
+
+        print("[dvdrip] HandBrake found no titles; retrying via MakeMKV using %s..."
+              % source)
+        if args.verbose:
+            print(' '.join(cmd))
+            result = subprocess.run(cmd, check=False)
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=False, check=False)
+
+        if result.returncode != 0:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            last_error = UserError("MakeMKV extraction failed via %s (exit status %d). %s"
+                                   % (source, result.returncode,
+                                      detail_from_completed_process(result)))
+            continue
+
+        try:
+            mkv_files = locate_makemkv_mkv_output(output_dir)
+        except UserError as exc:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            last_error = UserError("%s. Tried MakeMKV source %s."
+                                   % (exc.message, source))
+            continue
+
+        print("[dvdrip] MakeMKV extracted %d title(s)." % len(mkv_files))
+        return mkv_files, output_dir
+
+    if last_error is not None:
+        raise last_error
+    raise UserError("MakeMKV fallback did not have any source candidates to try.")
 
 HANDBRAKE = 'HandBrakeCLI'
 
@@ -416,15 +665,39 @@ TOTAL_EJECT_SECONDS = 5
 EJECT_ATTEMPTS_PER_SECOND = 10
 
 class DVD:
-    def __init__(self, mountpoint, verbose, mount_timeout=0):
-        if stat.S_ISBLK(os.stat(mountpoint).st_mode):
-            mountpoint = FindMountPoint(mountpoint, mount_timeout)
-        if not os.path.isdir(mountpoint):
-            raise UserError('%r is not a directory' % mountpoint)
-        self.mountpoint = mountpoint
+    def __init__(self, input_path, verbose, mount_timeout=0):
+        self.device = None
+        self.mountpoint = None
+
+        mode = os.stat(input_path).st_mode
+        if stat.S_ISBLK(mode):
+            self.device = input_path
+            try:
+                self.mountpoint = FindMountPoint(input_path, mount_timeout)
+            except UserError:
+                self.mountpoint = None
+        elif os.path.isdir(input_path):
+            self.mountpoint = input_path
+        else:
+            raise UserError('%r is not a directory or block device' % input_path)
+
+        self.handbrake_input = self.device or self.mountpoint
+        self.active_handbrake_input = self.handbrake_input
         self.verbose = verbose
 
-    def RipTitle(self, task, output, dry_run, verbose, no_subtitles=False):
+    def HandBrakeInputCandidates(self):
+        candidates = []
+        for candidate in (
+                self.device,
+                self.mountpoint,
+                os.path.join(self.mountpoint, 'VIDEO_TS') if self.mountpoint else None):
+            if not candidate:
+                continue
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return tuple(candidates)
+
+    def RipTitle(self, task, output, dry_run, verbose, no_subtitles=False, quality=16):
         if verbose:
             print('Title Scan:')
             pprint(task.title.info)
@@ -442,11 +715,11 @@ class DVD:
 
         args = [
             HANDBRAKE,
-            '--input', self.mountpoint,
+            '--input', self.active_handbrake_input,
             '--title', str(task.title.number),
 
             '--encoder', 'x265',
-            '--quality', '16',
+            '--quality', str(quality),
 
             # Use -E copy instead of --audio X --aencoder copy
             # This matches manual encoding and produces better quality
@@ -484,23 +757,60 @@ class DVD:
                 check_err(args)
 
     def ScanTitle(self, i):
-        for line in check_err([
-            HANDBRAKE,
-            #'--no-dvdnav', # TODO: turn this on as a fallback
-            '--scan',
-            '--title', str(i),
-            '-i',
-            self.mountpoint], stdout=subprocess.PIPE).split(os.linesep):
+        for line in self.RunTitleScan(i).split(os.linesep):
                 if self.verbose:
                         print('< %s' % line.rstrip())
                 yield line
+
+    def RunTitleScan(self, i):
+        last_exc = None
+        attempts = []
+        for input_candidate in self.HandBrakeInputCandidates():
+            for use_no_dvdnav in (False, True):
+                args = [
+                    HANDBRAKE,
+                ]
+                if use_no_dvdnav:
+                    args.append('--no-dvdnav')
+                args += [
+                    '--scan',
+                    '--title', str(i),
+                    '-i',
+                    input_candidate,
+                ]
+                try:
+                    result = check_err(args, stdout=subprocess.PIPE)
+                    self.active_handbrake_input = input_candidate
+                    if input_candidate != self.handbrake_input:
+                        warn("Title %d scan succeeded using alternate HandBrake input %r."
+                             % (i, input_candidate))
+                    if use_no_dvdnav:
+                        warn("Title %d scan succeeded with --no-dvdnav." % i)
+                    return result
+                except subprocess.CalledProcessError as exc:
+                    last_exc = exc
+                    attempts.append({
+                        'input': input_candidate,
+                        'no_dvdnav': use_no_dvdnav,
+                        'detail': decode_process_output(exc.output),
+                    })
+        summary = summarize_scan_attempts(i, attempts)
+        if summary:
+            warn(summary)
+        if last_exc is not None:
+            raise last_exc
+        raise UserError("No HandBrake input candidates available for scanning.")
 
     def ScanTitles(self, title_numbers, verbose):
         """
         Returns an iterable of parsed titles.
         """
         first = title_numbers[0] if title_numbers else 1
-        raw_scan = tuple(self.ScanTitle(first))
+        try:
+            raw_scan = tuple(self.ScanTitle(first))
+        except subprocess.CalledProcessError as exc:
+            raise UserError(build_scan_failure_message(
+                first, exc, mountpoint=self.mountpoint))
         title_count = FindTitleCount(raw_scan, verbose)
         print('Disc claims to have %d titles.' % title_count)
         title_name, title_info = only(
@@ -533,17 +843,19 @@ class DVD:
 
     def Eject(self):
         if os.name == 'nt':
-            if len(self.mountpoint) < 4 and self.mountpoint[1] == ':':
+            target = self.device or self.mountpoint
+            if len(target) < 4 and target[1] == ':':
                 # mountpoint is only a drive letter like "F:" or "F:\" not a subdirectory
-                drive_letter = self.mountpoint[0]
+                drive_letter = target[0]
                 ctypes.windll.WINMM.mciSendStringW("open %s: type CDAudio alias %s_drive" % (drive_letter, drive_letter), None, 0, None)
                 ctypes.windll.WINMM.mciSendStringW("set %s_drive door open" % drive_letter, None, 0, None)
             return
 
         # TODO: this should really be a while loop that terminates once a
         # deadline is met.
+        target = self.device or self.mountpoint
         for i in range(TOTAL_EJECT_SECONDS * EJECT_ATTEMPTS_PER_SECOND):
-            if not subprocess.call(['eject', self.mountpoint]):
+            if not subprocess.call(['eject', target]):
                 return
             time.sleep(1.0 / EJECT_ATTEMPTS_PER_SECOND)
 
@@ -651,7 +963,7 @@ def TaskFilenames(tasks, output, dry_run=False, metadata=None):
     return result
 
 def PerformTasks(dvd, tasks, title_count, filenames,
-        dry_run=False, verbose=False, no_subtitles=False):
+        dry_run=False, verbose=False, no_subtitles=False, quality=16):
     for task, filename in zip(tasks, filenames):
         print('=' * 78)
         if task.chapter is None:
@@ -664,7 +976,7 @@ def PerformTasks(dvd, tasks, title_count, filenames,
                         num_chapters, filename))
         print('-' * 78)
         try:
-            dvd.RipTitle(task, filename, dry_run, verbose, no_subtitles)
+            dvd.RipTitle(task, filename, dry_run, verbose, no_subtitles, quality=quality)
         except subprocess.CalledProcessError as exc:
             warn("Failed to encode title %d (exit status %d), skipping."
                  % (task.title.number, exc.returncode))
@@ -874,6 +1186,39 @@ def join_mp4_files(input_files, output_file, verbose=False):
             warn(f"FFmpeg error: {result.stderr.decode('utf-8', errors='replace')}")
         return False
 
+    return True
+
+def encode_mkv_to_mp4(input_file, output_file, quality=16,
+        verbose=False, no_subtitles=False):
+    args = [
+        'ffmpeg',
+        '-i', input_file,
+        '-map', '0:v:0',
+        '-map', '0:a?',
+        '-c:v', 'libx265',
+        '-crf', str(quality),
+        '-preset', 'medium',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        '-y',
+        output_file,
+    ]
+    if no_subtitles:
+        args.insert(-2, '-sn')
+
+    if verbose:
+        print(f"[dvdrip] Encoding {input_file} -> {output_file}")
+        print(' '.join(args))
+        result = subprocess.run(args, check=False)
+    else:
+        result = subprocess.run(args, capture_output=True, text=False, check=False)
+
+    if result.returncode != 0:
+        detail = decode_process_output(result.stderr).strip()
+        if not detail:
+            detail = decode_process_output(result.stdout).strip()
+        warn("FFmpeg remux failed for %r: %s" % (input_file, detail or 'unknown error'))
+        return False
     return True
 
 def search_tmdb(query, year=None, is_tv=False):
@@ -1102,6 +1447,10 @@ def ParseArgs():
             default=15,
             help="Amount of time to wait for a mountpoint to be mounted",
             type=float)
+    parser.add_argument('--quality',
+            default=16,
+            type=int,
+            help="Video quality for x265 encoding; higher values produce smaller files (default: 16).")
     parser.add_argument('--title-search',
             help="Search TMDb for this title and use metadata for naming")
     parser.add_argument('--year',
@@ -1125,6 +1474,11 @@ def ParseArgs():
     parser.add_argument('--keep-files',
             action='store_true',
             help="Keep individual files after joining (default: delete them)")
+    parser.add_argument('--use-makemkv-fallback',
+            action='store_true',
+            help="If HandBrake cannot scan DVD titles, try decrypting with MakeMKV and retry.")
+    parser.add_argument('--makemkv-source',
+            help="Override MakeMKV source specifier (for example: disc:0).")
     args = parser.parse_args()
 
     if not args.input:
@@ -1167,25 +1521,29 @@ def parse_titles_arg(titles_arg):
 
 def main():
     args = ParseArgs()
-    # If input is a block device (e.g. /dev/sr0), convert it to a mountpoint
-    mounted_temp_dir = None
-
-    if is_block_device(args.input):
-        mp = find_mountpoint(args.input)
-        if mp:
-            args.input = mp
-        else:
-            # Mount it now (read-only)
-            mounted_temp_dir = mount_device_readonly(args.input, timeout_sec=args.mount_timeout)
-            args.input = mounted_temp_dir
+    makemkv_temp_dir = None
+    makemkv_files = None
 
     try:
-        dvd = DVD(args.input, args.verbose, args.mount_timeout)
-        print('Reading from %r' % dvd.mountpoint)
+        physical_dvd = DVD(args.input, args.verbose, args.mount_timeout)
+        dvd = physical_dvd
+        print('Reading from %r' % dvd.handbrake_input)
         title_numbers = parse_titles_arg(args.titles)
-        titles = tuple(dvd.ScanTitles(title_numbers, args.verbose))
+        try:
+            titles = tuple(dvd.ScanTitles(title_numbers, args.verbose))
+        except UserError as exc:
+            if should_try_makemkv_fallback(exc, dvd, args):
+                makemkv_files, makemkv_temp_dir = decrypt_with_makemkv(dvd, args)
+                titles = ()
+            else:
+                raise
 
         if args.scan:
+            if makemkv_files is not None:
+                print("[dvdrip] MakeMKV extracted the following title files:")
+                for path in makemkv_files:
+                    print("  %s" % path)
+                return
             # Fetch metadata for scan display if available
             metadata = None
             if not args.no_metadata:
@@ -1212,6 +1570,80 @@ def main():
 
             DisplayScan(titles, metadata=metadata)
         else:
+            if makemkv_files is not None:
+                if not args.output:
+                    raise UserError("No output specified")
+
+                metadata = None
+                if not args.no_metadata:
+                    try:
+                        if args.title_search:
+                            print(f"[dvdrip] Searching TMDb for '{args.title_search}'...")
+                            metadata = get_metadata_from_tmdb(
+                                search_query=args.title_search,
+                                year=args.year,
+                                is_tv=args.tv
+                            )
+                        elif TMDB_AVAILABLE and load_tmdb_api_key():
+                            print("\n[dvdrip] TMDb metadata available. Search for better file naming?")
+                            response = input("Search TMDb? (y/n): ").strip().lower()
+                            if response in ('y', 'yes'):
+                                metadata = get_metadata_from_tmdb(
+                                    year=args.year,
+                                    is_tv=args.tv
+                                )
+
+                        if metadata:
+                            print(f"[dvdrip] Using metadata: {metadata['title']} ({metadata.get('year', 'unknown year')})")
+                    except Exception as e:
+                        warn(f"Metadata lookup failed: {e}")
+                        print("[dvdrip] Continuing with default naming...")
+
+                print('Writing to %r' % args.output)
+                if len(makemkv_files) == 1:
+                    if os.path.isdir(args.output):
+                        base_name = os.path.splitext(os.path.basename(makemkv_files[0]))[0]
+                        if metadata and metadata.get('title'):
+                            base_name = sanitize_filename(metadata['title'])
+                            if metadata.get('year'):
+                                base_name = f"{base_name} ({metadata['year']})"
+                        output_files = [os.path.join(args.output, f"{base_name}.mp4")]
+                    else:
+                        output_files = [args.output if args.output.lower().endswith('.mp4')
+                                        else f"{args.output}.mp4"]
+                else:
+                    output_dir = args.output
+                    if output_dir.lower().endswith('.mp4'):
+                        output_dir = os.path.splitext(output_dir)[0]
+                    output_files = []
+                    for index, src in enumerate(makemkv_files, 1):
+                        base_name = f"Title{index:02d}"
+                        output_files.append(os.path.join(output_dir, f"{base_name}.mp4"))
+
+                for filename in output_files:
+                    if os.path.exists(filename):
+                        raise UserError('%r already exists' % filename)
+
+                output_dirs = {os.path.dirname(path) or '.' for path in output_files}
+                for path in output_dirs:
+                    if path != '.' and not os.path.isdir(path):
+                        os.makedirs(path, exist_ok=True)
+
+                for src, dest in zip(makemkv_files, output_files):
+                    print('=' * 78)
+                    print("[dvdrip] Encoding %r => %r" % (src, dest))
+                    print('-' * 78)
+                    if not args.dry_run and not encode_mkv_to_mp4(
+                            src, dest, quality=args.quality,
+                            verbose=args.verbose,
+                            no_subtitles=args.no_subtitles):
+                        raise UserError("Failed to encode %r" % src)
+
+                print('=' * 78)
+                if not args.dry_run:
+                    physical_dvd.Eject()
+                return
+
             if args.main_feature and len(titles) > 1:
                 # TODO: make this affect scan as well
                 titles = [FindMainFeature(titles, args.verbose)]
@@ -1261,7 +1693,8 @@ def main():
 
                 PerformTasks(dvd, tasks, len(titles), filenames,
                         dry_run=args.dry_run, verbose=args.verbose,
-                        no_subtitles=args.no_subtitles)
+                        no_subtitles=args.no_subtitles,
+                        quality=args.quality)
 
                 # Handle joining if requested
                 if (args.join or args.join_titles) and not args.dry_run:
@@ -1340,10 +1773,10 @@ def main():
 
                 print('=' * 78)
                 if not args.dry_run:
-                    dvd.Eject()
+                    physical_dvd.Eject()
     finally:
-        if mounted_temp_dir:
-            unmount(mounted_temp_dir)
+        if makemkv_temp_dir:
+            shutil.rmtree(makemkv_temp_dir, ignore_errors=True)
 
 def warn(msg):
         print('warning: %s' % (msg,), file=sys.stderr)
